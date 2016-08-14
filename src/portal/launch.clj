@@ -9,3 +9,5 @@
     (portal/server server-config-map)
   (print "------------------ portal complete--------------------"))
 
+(-main)
+

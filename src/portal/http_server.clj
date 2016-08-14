@@ -59,6 +59,26 @@
                                            (if a (type a)
                                              "null"))))))
 
+(defn counting-stream [underlying-inputstream]
+  (let [count (java.util.concurrent.atomic.AtomicLong.)]
+    (proxy [java.io.InputStream clojure.lang.IDeref] []
+      (read
+        ([]
+          (let [x (.read underlying-inputstream)]
+            (if (not= -1 x) (.incrementAndGet count))
+            x))
+        ([b]
+          (let [x (.read underlying-inputstream b)]
+            (if (not= -1 x) (.addAndGet count x))
+            x))
+        ([b off len]
+          (let [x (.read underlying-inputstream b off len)]
+            (if (not= -1 x) (.addAndGet count x))
+            x)))
+      (available [] (.available underlying-inputstream))
+      (close [] (.close underlying-inputstream))
+      (deref[] (.get count)))))
+
 (defn stream->bytes
   [x]
   (with-open [out (java.io.ByteArrayOutputStream.)]
@@ -215,7 +235,7 @@
                         response)]
     (if (dont-manipulate-response? response)
       (assoc response :frame-count (atom -1) :body-byte-count (atom -1))
-      (let [compress? (response-needs-compression? request response)
+      (let [compress? false;(response-needs-compression? request response)
             meta (dissoc response :body :headers)
             headers (merge {"X-UA-Compatible" "IE=Edge"
                             "Access-Control-Allow-Origin" (or (get (:headers 
@@ -230,22 +250,21 @@
             _ (when (and (or (:websocket? request) (:eventsource? request))
                          (not (seq-like? body)))
                 (throw (Exception. (str "response must be s sequence, result were instead: "(type body)))))
-;            [body-byte-count body] (cond (:websocket? request)
-;                                         (seq-size body)
-;                                         (:eventsource? request)
-;                                         (->> body
-;                                           to-event-stream
-;                                           seq-size)
-;                                         :else
-;                                         (let [counted-body (atom 128);(sm/counting-stream (is body))
-;                                               body (if compress? (gz-compress counted-body)
-;                                                      counted-body)]
-;                                           [counted-body (to-byte-buffer-seq body)]))
+            [body-byte-count body] (cond (:websocket? request)
+                                         (seq-size body)
+                                         (:eventsource? request)
+                                         (->> body
+                                           to-event-stream
+                                           seq-size)
+                                         :else
+                                         (let [counted-body (counting-stream (is body))
+                                               body (if compress? (gz-compress counted-body)
+                                                      counted-body)]
+                                           [counted-body (to-byte-buffer-seq body)]))
             frame-count (atom 0)
-            body (to-byte-buffer-seq (is body))
             body (map (fn [x] (swap! frame-count inc) x) body)]
         (merge {:frame-count frame-count
-                :body-byte-count (atom 0)
+                :body-byte-count body-byte-count
                 :body body}
                meta 
                {:headers headers})))))
@@ -263,7 +282,7 @@
                    :sending 0
                    :ttfb 0
                    :bytes 0
-                   :frame 0})
+                   :frames 0})
 
 (defn register-connect [ip-address]
   (let [ip-address (if (map? ip-address)
@@ -322,37 +341,34 @@
       (try (swap! global-inflight-requests assoc id request-without-body)
         (register-connect request-without-body)
         (let [response (handler-fn request)
-              ;response (prepare-response request-without-body response)
-              response-without-body (dissoc request :body)
-;              sent-response (if (dont-manipulate-response? response)
-;                              response
-;                              (send-response request-without-body response))
+              response (prepare-response request-without-body response)
+              response-without-body (dissoc response :body)
+              sent-response (if (dont-manipulate-response? response)
+                              response
+                              (send-response request-without-body response))
               response-without-body (assoc response-without-body :time-sent 
                                            (System/currentTimeMillis))
-;              response-without-body (assoc response-without-body
-;                                           :ttfb (- (:time-out response-without-body)
-;                                                    (:time-in response-without-body))
-;                                           :sending (- (:time-out response-without-body)
-;                                                    (:time-in response-without-body))
-;                                           :ttlb (- (:time-sent response-without-body)
-;                                                    (:time-in response-without-body)))
+              response-without-body (assoc response-without-body
+                                           :ttfb (- (:time-out response-without-body)
+                                                    (:time-in request))
+                                           :sending (- (:time-out response-without-body)
+                                                    (:time-sent response-without-body))
+                                           :ttlb (- (:time-sent response-without-body)
+                                                    (:time-in request)))
               ]
           (result-fn request-without-body response-without-body)
-          ;(add-recent-request-response-pair request-without-body response-without-body)
-;          (register-disconnect request-without-body
-;                              (:sending response-without-body)
-;                              (:ttfb response-without-body)
-;                              (:ttlb response-without-body)
-;                              @(:body-byte-count response-without-body)
-;                              @(:frame-count response-without-body))
-;          ;sent-response
-           {:status  200
-      :headers {"Content-Type" "text/html"}
-      :body    response})
+          (add-recent-request-response-pair request-without-body response-without-body)
+          (register-disconnect request-without-body
+                              (:sending response-without-body)
+                              (:ttfb response-without-body)
+                              (:ttlb response-without-body)
+                              @(:body-byte-count response-without-body)
+                              @(:frame-count response-without-body))
+          sent-response)
         (catch Throwable e
           (result-fn request-without-body e)
-          ;(add-recent-request-response-pair request-without-body e)
-          ;(register-disconnect request-without-body 0 0 0 0 0)
+          (add-recent-request-response-pair request-without-body e)
+          (register-disconnect request-without-body 0 0 0 0 0)
           (throw e))
         (finally
           (swap! global-inflight-requests dissoc id))))))
